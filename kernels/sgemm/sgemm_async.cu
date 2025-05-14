@@ -44,6 +44,8 @@ __global__ void sgemm_t_8x4_sliced_k16_f32x4_bcf_dbuf_kernel(
   float r_c[TM][TN] = {0.0}; // 8x4
   
   // 128 threads, tx: 0~15, ty: 0~7
+  // smem_a BK*BM = 16*64, load 8 values per thread
+  // smem_b BK*BN = 16*64, load 8 values per thread
   int load_a_smem_m = tid / 2; // (0,1,2,...,63)
   int load_a_smem_k = (tid % 2 == 0) ? 0 : 8; // (0,8)
   int load_b_smem_k = tid / 8; // 0~15
@@ -52,11 +54,14 @@ __global__ void sgemm_t_8x4_sliced_k16_f32x4_bcf_dbuf_kernel(
   int load_b_gmem_n = bx * BN + load_b_smem_n;
 
   {
+    // 此时bk=0
     int load_a_gmem_k = load_a_smem_k;
     int load_a_gmem_addr = load_a_gmem_m * K + load_a_gmem_k;
     int load_b_gmem_k = load_b_smem_k;
     int load_b_gmem_addr = load_b_gmem_k * N + load_b_gmem_n;
 
+    // 线程块内的线程并行搬运数据，每个线程搬运8个float，
+    // 因此线程块同步之前，并行的将s_b[0]部分填充完毕，s_a[0]部分也填充完毕
     #pragma unroll
     for(int i = 0; i < 8; i += 4) {
       FLOAT4(s_b[0][load_b_smem_k][load_b_smem_n + i]) = (
@@ -75,6 +80,7 @@ __global__ void sgemm_t_8x4_sliced_k16_f32x4_bcf_dbuf_kernel(
     int smem_sel = (bk - 1) & 1;
     int smem_sel_next = bk & 1;
 
+    // 准备下一批次的数据,相比上面循环之外的bk=0的数据搬运，有些许不同
     int load_a_gmem_k = bk * BK + load_a_smem_k;
     int load_a_gmem_addr = load_a_gmem_m * K + load_a_gmem_k;
     int load_b_gmem_k = bk * BK + load_b_smem_k;
@@ -86,6 +92,8 @@ __global__ void sgemm_t_8x4_sliced_k16_f32x4_bcf_dbuf_kernel(
       FLOAT4(r_load_a[i]) = (FLOAT4(a[load_a_gmem_addr + i]));
     }
    
+    // 计算当前批次的矩阵结果
+    // 取A矩阵的列，与B矩阵的行进行点乘
     #pragma unroll
     for (int tk = 0; tk < BK; tk++) {
       // ty: 0~7, (0~7)*8=64; tx: 0~15, (0~15)*4=64
@@ -167,6 +175,8 @@ __global__ void sgemm_t_8x4_sliced_k16_f32x4_bcf_dbuf_async_kernel(
     int load_a_gmem_addr = load_a_gmem_m * K + load_a_gmem_k;
     int load_b_gmem_k = load_b_smem_k;
     int load_b_gmem_addr = load_b_gmem_k * N + load_b_gmem_n;
+    // 将一个共享内存的高级C++指针转换为数值形式的地址（uint32_t类型），
+    // 这个地址值可以被底层PTX汇编指令直接使用
     uint32_t load_b_smem_ptr = __cvta_generic_to_shared(
       &s_b[0][load_b_smem_k][load_b_smem_n]);
     // 2 cp.async issue, 16 bytes = 4 float.
@@ -188,6 +198,7 @@ __global__ void sgemm_t_8x4_sliced_k16_f32x4_bcf_dbuf_async_kernel(
   }
   __syncthreads(); 
 
+  // 用双缓冲管理不同K维度切片之间的数据流转，同时用cp.async在单次迭代内实现真正的内存计算重叠。
   for (int bk = 1; bk < (K + BK - 1) / BK; bk++) {
 
     int smem_sel = (bk - 1) & 1;

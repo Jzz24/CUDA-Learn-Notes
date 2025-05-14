@@ -31,6 +31,7 @@ __device__ __forceinline__ float warp_reduce_sum_f32(float val) {
 // Dot Product
 // grid(N/256), block(256)
 // a: Nx1, b: Nx1, y=sum(elementwise_mul(a,b))
+// warp内shuffle → 块内共享内存 → 全局原子操作
 template<const int NUM_THREADS = 256>
 __global__ void dot_prod_f32_f32_kernel(float* a, float* b, float* y, int N) {
   int tid = threadIdx.x;
@@ -43,14 +44,14 @@ __global__ void dot_prod_f32_f32_kernel(float* a, float* b, float* y, int N) {
   int warp = tid / WARP_SIZE;
   int lane = tid % WARP_SIZE;
   // perform warp sync reduce.
-  prod = warp_reduce_sum_f32<WARP_SIZE>(prod);
+  prod = warp_reduce_sum_f32<WARP_SIZE>(prod); // warp reduce sum
   // warp leaders store the data to shared memory.
   if (lane == 0) reduce_smem[warp] = prod;
   __syncthreads(); // make sure the data is in shared memory.
   // the first warp compute the final sum.
   prod = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) prod = warp_reduce_sum_f32<NUM_WARPS>(prod);
-  if (tid == 0) atomicAdd(y, prod);
+  if (warp == 0) prod = warp_reduce_sum_f32<NUM_WARPS>(prod); // block reduce sum
+  if (tid == 0) atomicAdd(y, prod); // grid reduce sum
 }
 
 // Dot Product + Vec4

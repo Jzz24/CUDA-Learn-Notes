@@ -22,8 +22,11 @@ __global__ void mat_trans_smem_naive_kernel(int* dev_A, int M, int N, int* dev_B
 
   if (row < M && col < N) {
     // 从全局内存中加载数据，转置后写到共享内存中
+    // smem里面，交换threadIdx.x和threadIdx.y，完成线程块内的转置
+    // 32路冲突
     s_data[threadIdx.x][threadIdx.y] = dev_A[row * N + col];
     __syncthreads();
+    // gmem写入时，交换blockIdx.x和blockIdx.y，完成线程块间的转置
     int n_col = blockIdx.y * blockDim.y + threadIdx.x;
     int n_row = blockIdx.x * blockDim.x + threadIdx.y;
     if (n_col < M && n_row < N) {
@@ -61,7 +64,7 @@ __global__ void mat_trans_smem_swizzle_kernel(int* dev_A, int M, int N, int* dev
 
   if (row < M && col < N) {
     // 从全局内存读取数据写入共享内存的逻辑坐标(row=x,col=y)
-    // 其映射的物理存储位置位置(row=x,col=x^y)
+    // 其映射的smem物理存储位置位置(row=x,col=x^y)，在线完成转置
     s_data[threadIdx.x][threadIdx.x ^ threadIdx.y] = dev_A[row * N + col];
     __syncthreads();
     int n_col = blockIdx.y * blockDim.y + threadIdx.x;

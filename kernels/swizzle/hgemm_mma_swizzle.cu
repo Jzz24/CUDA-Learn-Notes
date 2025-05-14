@@ -54,7 +54,7 @@ __global__ void hgemm_mma_m16n8k16_naive_kernel(half* A, half* B, half* C,
   __shared__ half s_b[MMA_K][MMA_N]; // 16x8
   __shared__ half s_c[MMA_M][MMA_N]; // 16x8
 
-  const int tid = threadIdx.y * blockDim.x + threadIdx.x; // within block
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x; // within block, 32 threads
   const int lane_id = tid % WARP_SIZE; // 0~31
 
   // s_a[16][16], 每行16，每线程load 8，需要2线程，共16行，需2x16=32线程
@@ -144,8 +144,9 @@ hgemm_mma_m16n8k16_mma2x4_warp4x4_kernel(
   __shared__ half s_a[BM][BK+A_PAD]; // 128*16*2=4KB
   __shared__ half s_b[BK][BN+B_PAD]; // 16*128*2=4KB, 16*(128+16)*2=4.5KB
 
+  // num_threads = MMA_TILE_M * MMA_TILE_N * WARP_SIZE = 2*4*32=256
   const int tid = threadIdx.y * blockDim.x + threadIdx.x; // within block
-  const int warp_id = tid / WARP_SIZE; // 0~7 warp_id within block
+  const int warp_id = tid / WARP_SIZE; // 0~7 warp_id within block, 2*4个warp
   const int lane_id = tid % WARP_SIZE; // 0~31
   const int warp_m = warp_id % 2; // 0,1
   const int warp_n = warp_id / 2; // 0,1,2,3
@@ -195,6 +196,10 @@ hgemm_mma_m16n8k16_mma2x4_warp4x4_kernel(
     // smem -> reg
     #pragma unroll
     for (int i = 0; i < WARP_TILE_M; ++i) {
+      // warp_smem_a_m: 0~127, warp_m: 0~1, i: 0~3, 
+      // mma_m: 16, warp_tile_m: 4
+      // warp 0/1/2/3循环warp_tile_m=4次处理s_a[0~63][0~15]的数据，每次循环处理16*16的数据量，即每个线程处理8个数据
+      // warp 4/5/6/7循环warp_tile_m=4次处理s_a[64~127][0~15]的数据，每次循环处理16*16的数据量，即每个线程处理8个数据
       int warp_smem_a_m = warp_m * (MMA_M * WARP_TILE_M) + i * MMA_M;
       int lane_smem_a_m = warp_smem_a_m + lane_id % 16; // 0~15
       int lane_smem_a_k = (lane_id / 16) * 8; // 0,8
@@ -205,6 +210,8 @@ hgemm_mma_m16n8k16_mma2x4_warp4x4_kernel(
 
     #pragma unroll
     for (int j = 0; j < WARP_TILE_N; ++j) {
+      // warp_smem_b_n: 0~127, warp_n: 0~3, j: 0~3,
+      // mma_n: 8, warp_tile_n: 4
       int warp_smem_b_n = warp_n * (MMA_N * WARP_TILE_N) + j * MMA_N;
       int lane_smem_b_k = lane_id % 16;  // 0~15
       int lane_smem_b_n = warp_smem_b_n; // 0, MMA_N=8
@@ -232,6 +239,9 @@ hgemm_mma_m16n8k16_mma2x4_warp4x4_kernel(
   for (int i = 0; i < WARP_TILE_M; ++i) {
     #pragma unroll
     for (int j = 0; j < WARP_TILE_N; ++j) {
+      // warp_smem_c_m: 0~127, warp_m: 0~1, i: 0~3,
+      // store_warp_smem_c_m = warp_m * 64 + i * 16
+      // store_warp_smem_c_n = warp_n * 32 + j * 8
       int store_warp_smem_c_m = warp_m * (MMA_M * WARP_TILE_M) + i * MMA_M;
       int store_warp_smem_c_n = warp_n * (MMA_N * WARP_TILE_N) + j * MMA_N;
       // mapping lane smem index -> global index.
@@ -259,6 +269,27 @@ __device__ __host__ __forceinline__ int swizzle_A_j(int i, int j) {
   // (0, 8, 0, 8, 0, 8, 0, 8)
   // >>> sw(12,0),sw(12,8),sw(13,0),sw(13,8),sw(14,0),sw(14,8),sw(15,0),sw(15,8)       
   // (8, 0, 8, 0, 8, 0, 8, 0)
+  //   原始列索引:  0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15
+  //             --------------------------------------- 
+  // 行0:        [0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15]  ← swizzle(0,0)=0, swizzle(0,8)=8
+  // 行1:        [0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15]  ← 相同映射
+  // 行2:        [0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15]  ← 相同映射
+  // 行3:        [0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15]  ← 相同映射
+  //             --------------------------------------- 
+  // 行4:        [8 9 10 11 12 13 14 15 | 0 1 2 3 4 5 6 7]  ← swizzle(4,0)=8, swizzle(4,8)=0 - 列区块交换！
+  // 行5:        [8 9 10 11 12 13 14 15 | 0 1 2 3 4 5 6 7]  ← 相同映射
+  // 行6:        [8 9 10 11 12 13 14 15 | 0 1 2 3 4 5 6 7]  ← 相同映射
+  // 行7:        [8 9 10 11 12 13 14 15 | 0 1 2 3 4 5 6 7]  ← 相同映射
+  //             --------------------------------------- 
+  // 行8:        [0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15]  ← swizzle(8,0)=0, swizzle(8,8)=8 - 恢复原始排列
+  // 行9:        [0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15]  ← 相同映射
+  // 行10:       [0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15]  ← 相同映射
+  // 行11:       [0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15]  ← 相同映射
+  //             --------------------------------------- 
+  // 行12:       [8 9 10 11 12 13 14 15 | 0 1 2 3 4 5 6 7]  ← swizzle(12,0)=8, swizzle(12,8)=0 - 再次交换
+  // 行13:       [8 9 10 11 12 13 14 15 | 0 1 2 3 4 5 6 7]  ← 相同映射
+  // 行14:       [8 9 10 11 12 13 14 15 | 0 1 2 3 4 5 6 7]  ← 相同映射
+  // 行15:       [8 9 10 11 12 13 14 15 | 0 1 2 3 4 5 6 7]  ← 相同映射
   return ((int(j / 8) ^ int(i / 4)) % 2) * 8;
 }
 
@@ -530,8 +561,8 @@ void launch_hgemm_mma_m16n8k16_mma2x4_warp4x4(
   constexpr int NUM_THREADS= (
     MMA_TILE_M * MMA_TILE_N * WARP_SIZE); // 2 * 4 * 32 = 256                                  
   dim3 block(NUM_THREADS);
-  dim3 grid(div_ceil(N, MMA_N * MMA_TILE_N * WARP_TILE_N), 
-            div_ceil(M, MMA_M * MMA_TILE_M * WARP_TILE_M));
+  dim3 grid(div_ceil(N, MMA_N * MMA_TILE_N * WARP_TILE_N), // N /（8*4*4）
+            div_ceil(M, MMA_M * MMA_TILE_M * WARP_TILE_M)); // M /（16*2*4）
  
   hgemm_mma_m16n8k16_mma2x4_warp4x4_kernel<
     MMA_M, MMA_N, MMA_K, MMA_TILE_M, MMA_TILE_N, 
@@ -662,3 +693,93 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
+
+
+// //
+// +-------------------------------+  ← 整个Block处理128×128矩阵块
+// |                               |
+// |  +---+ +---+ +---+ +---+      |
+// |  |W0 | |W1 | |W2 | |W3 |      |  每行4个warp (MMA_TILE_N=4)
+// |  +---+ +---+ +---+ +---+      |
+// |                               |
+// |  +---+ +---+ +---+ +---+      |  
+// |  |W4 | |W5 | |W6 | |W7 |      |  总共2行warp (MMA_TILE_M=2)
+// |  +---+ +---+ +---+ +---+      |
+// |                               |
+// +-------------------------------+
+
+// 每个warp (例如W0) 内部处理:
+// +--------------------+  ← 单个warp处理64×32矩阵块
+// |  +--+ +--+ +--+ +--+  
+// |  |M0| |M1| |M2| |M3|    每行4个MMA (WARP_TILE_N=4)
+// |  +--+ +--+ +--+ +--+
+// |                    |
+// |  +--+ +--+ +--+ +--+
+// |  |M4| |M5| |M6| |M7|    
+// |  +--+ +--+ +--+ +--+
+// |                    |
+// |  +--+ +--+ +--+ +--+
+// |  |M8| |M9| |MA| |MB|    总共4行MMA (WARP_TILE_M=4)
+// |  +--+ +--+ +--+ +--+
+// |                    |
+// |  +--+ +--+ +--+ +--+
+// |  |MC| |MD| |ME| |MF|
+// |  +--+ +--+ +--+ +--+
+// +--------------------+
+
+// 每个MMA单元:
+// +------+  ← 单个MMA处理16×8矩阵块
+// |      |
+// | 16×8 |    (MMA_M=16, MMA_N=8)
+// |      |
+// +------+
+// //
+
+// s_a 128x16，对应8个warp的映射关系
+// 列(0-15)
+// +------------------------------------------------+
+// |                    s_a矩阵                      |
+// |                                                |
+// |  +------------------------------------------+  |
+// |  |                                          |  |
+// 行    |  |             WARP 0,1,2,3                |  |
+// |  |            (负责行0-63)                  |  |
+// 0    |  |                                          |  |
+// |    |  +------------------------------------------+  |
+// 63   |  |                                          |  |
+// |  |             WARP 4,5,6,7                |  |
+// |  |            (负责行64-127)                |  |
+// |    |  |                                          |  |
+// 127   |  +------------------------------------------+  |
+// |                                                |
+// +------------------------------------------------+
+
+// WARP 0 (同理适用于WARP 1,2,3):
+// +------------------------------------------------+
+// |                i=0 循环                         |
+// |          处理行0-15的所有16列                   |
+// +------------------------------------------------+
+// |                i=1 循环                         |
+// |          处理行16-31的所有16列                  |
+// +------------------------------------------------+
+// |                i=2 循环                         |
+// |          处理行32-47的所有16列                  |
+// +------------------------------------------------+
+// |                i=3 循环                         |
+// |          处理行48-63的所有16列                  |
+// +------------------------------------------------+
+
+// WARP 4 (同理适用于WARP 5,6,7):
+// +------------------------------------------------+
+// |                i=0 循环                         |
+// |          处理行64-79的所有16列                  |
+// +------------------------------------------------+
+// |                i=1 循环                         |
+// |          处理行80-95的所有16列                  |
+// +------------------------------------------------+
+// |                i=2 循环                         |
+// |          处理行96-111的所有16列                 |
+// +------------------------------------------------+
+// |                i=3 循环                         |
+// |          处理行112-127的所有16列                |
+// +------------------------------------------------+

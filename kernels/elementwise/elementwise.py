@@ -43,7 +43,7 @@ def run_benchmark(perf_func: callable, a: torch.Tensor, b: torch.Tensor, tag: st
             perf_func(a, b, out)
     else:
         for i in range(iters):
-            out = perf_func(a, b) 
+            out = perf_func(a, b)
     torch.cuda.synchronize()
     end = time.time()
     total_time = (end - start) * 1000 # ms

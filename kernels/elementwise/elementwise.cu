@@ -17,6 +17,12 @@
 #define BFLOAT2(value) (reinterpret_cast<__nv_bfloat162*>(&(value))[0])
 #define LDST128BITS(value) (reinterpret_cast<float4*>(&(value))[0])
 
+// 这个宏的执行步骤：
+
+// &(value) - 获取参数的内存地址
+// reinterpret_cast<float4*>(...) - 将该地址转换为float4*类型的指针
+// [0] - 关键操作：这是指针解引用，访问指针指向的内容，返回一个float4结构体值
+
 // -------------------------------------- FP32 -------------------------------------- 
 // ElementWise Add  
 // grid(N/256), block(256)

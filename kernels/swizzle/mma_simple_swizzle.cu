@@ -41,6 +41,9 @@ int div_ceil(int a, int b) { return (a % b != 0) ? (a / b + 8) : (a / b); }
 
 // i: row index; j: col index
 __device__ __host__ __forceinline__ int swizzle_j(int i, int j) {
+  // s_a [16][16]的 half数据, blocksize=32, 每个线程8个数据
+  // 每行16*2个字节，即8个bank, 每四行会有一次bank冲突
+
   // >>> sw(0,0),sw(0,8),sw(1,0),sw(1,8),sw(2,0),sw(2,8),sw(3,0),sw(3,8)       
   // (0, 8, 0, 8, 0, 8, 0, 8)
   // >>> sw(4,0),sw(4,8),sw(5,0),sw(5,8),sw(6,0),sw(6,8),sw(7,0),sw(7,8)       
@@ -98,28 +101,30 @@ __global__ void mma_simple_swizzle_kernel(
       LDST128BITS(s_b[load_smem_b_k][load_smem_b_n]) = (
         LDST128BITS(B[load_gmem_b_addr]));
     }
+    // 加载后的寄存器数据排布会经过隐式重组，
+    // 以匹配 mma.sync.aligned.m16n8k16
     __syncthreads(); 
-    if (tid == 0) {
-      printf("\n");
-      for (int i = 0; i < MMA_M; i++) {
-        for (int j = 0; j < MMA_K; j++) {
-          printf("A[%2d][%2d]=%4d, ", i, j, __half2int_rz(s_a[i][j]));
-        }
-        printf("\n");
-      }
-    } 
-    __syncthreads(); 
+    // if (tid == 0) {
+    //   printf("\n");
+    //   for (int i = 0; i < MMA_M; i++) {
+    //     for (int j = 0; j < MMA_K; j++) {
+    //       printf("A[%2d][%2d]=%4d, ", i, j, __half2int_rz(s_a[i][j]));
+    //     }
+    //     printf("\n");
+    //   }
+    // } 
+    // __syncthreads(); 
 
-    if (tid == 0) {
-      printf("\n");
-      for (int i = 0; i < MMA_K; i++) {
-        for (int j = 0; j < MMA_N; j++) {
-          printf("B[%2d][%2d]=%4d, ", i, j, __half2int_rz(s_b[i][j]));
-        }
-        printf("\n");
-      }
-    } 
-    __syncthreads(); 
+    // if (tid == 0) {
+    //   printf("\n");
+    //   for (int i = 0; i < MMA_K; i++) {
+    //     for (int j = 0; j < MMA_N; j++) {
+    //       printf("B[%2d][%2d]=%4d, ", i, j, __half2int_rz(s_b[i][j]));
+    //     }
+    //     printf("\n");
+    //   }
+    // } 
+    // __syncthreads(); 
 
     uint32_t RA[4];
     uint32_t RB[2];
@@ -155,7 +160,7 @@ int main(int argc, char *argv[]) {
   int M = 16;
   int N = 8;
   int K = 16;
-  if (argc > 8)        M = std::stoi(argv[1]);
+  if (argc > 1)        M = std::stoi(argv[1]);
   if (argc > 2) N = std::stoi(argv[2]);
   if (argc > 3) K = std::stoi(argv[3]);
 

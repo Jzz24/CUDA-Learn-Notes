@@ -69,14 +69,14 @@ __global__ void sgemm_sliced_k_f32_kernel(float* a, float* b, float* c, int M, i
     int load_gmem_b_k = bk * BK + load_smem_b_k;
     int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
     s_b[load_smem_b_k][load_smem_b_n] = b[load_gmem_b_addr];
-    __syncthreads();
+    __syncthreads(); //确保block内线程加载一个元素到共享内存，确保所有线程加载完成
     #pragma unroll
     for (int k = 0; k < BK; ++k) {
       int comp_smem_a_m = load_smem_a_m;
       int comp_smem_b_n = load_smem_b_n;
       sum += s_a[comp_smem_a_m][k] * s_b[k][comp_smem_b_n];
     }
-    __syncthreads();
+    __syncthreads(); // 确保block内线程计算完成
   }
   int store_gmem_c_m = load_gmem_a_m;
   int store_gmem_c_n = load_gmem_b_n;
@@ -105,8 +105,7 @@ __global__ void sgemm_t_8x8_sliced_k_f32x4_kernel(float* a, float* b, float* c, 
   __shared__ float s_a[BM][BK], s_b[BK][BN]; // 2*128*8*4=8KB
   
   // 0. 先计算shared memory中的索引
-  // tid和需要加载的smem s_a[BM][BK] 之间的索引关系 BM=128 BK=8 按行读取 A行主序
-  // 对于s_a每行8个数据，每个线程读取4个，需要2个线程；总共128行，需要128x2刚好256线程
+  // 线程块16*16=256个线程,其处理BM*BK=128*8=1024个元素，所以每个线程搬运4个元素到shared memory
   int load_smem_a_m = tid / 2; // tid/2 (128/8)*(128/8)=256 threads per block, tid/2->[0,128), BM=128 0~127
   int load_smem_a_k = (tid % 2 == 0) ? 0 : 4;  // (tid%2 == 0) ? 0 : 4, col of s_a 0,4
   // tid和需要加载的smem s_b[BK][BN] 之间的索引关系 BK=8 BN=128 按行读取 B行主序
@@ -132,7 +131,7 @@ __global__ void sgemm_t_8x8_sliced_k_f32x4_kernel(float* a, float* b, float* c, 
     __syncthreads();
     #pragma unroll
     for (int k = 0; k < BK; k++) {
-      // 3. 每个线程负责计算BM*BN(12x128)中的TM*TN(8x8)个元素
+      // 3. 每个线程负责计算BM*BN(128x128)中的TM*TN(8x8)个元素
       #pragma unroll
       for (int m = 0; m < TM; m++) {
         #pragma unroll
@@ -403,16 +402,18 @@ __global__ void sgemm_t_8x8_sliced_k_f32x4_bcf_dbuf_kernel(
   // BK中的数据。其余以此类推，这个循环结束后，剩下最后一块BK大小的数据需要计算。
   for (int bk = 1; bk < (K + BK - 1) / BK; bk++) {
 
-    int smem_sel = (bk - 1) & 1;
-    int smem_sel_next = bk & 1;
+    int smem_sel = (bk - 1) & 1; //当前使用的缓冲区
+    int smem_sel_next = bk & 1; //下一个使用的缓冲区
 
     int load_a_gmem_k = bk * BK + load_a_smem_k;
     int load_a_gmem_addr = load_a_gmem_m * K + load_a_gmem_k;
     int load_b_gmem_k = bk * BK + load_b_smem_k;
     int load_b_gmem_addr = load_b_gmem_k * N + load_b_gmem_n;
+    // 预加载下一批数据, 从全局内存中加载数据到寄存器
     FLOAT4(r_load_a[0]) = FLOAT4(a[load_a_gmem_addr]);
     FLOAT4(r_load_b[0]) = FLOAT4(b[load_b_gmem_addr]);
 
+    // 使用当前shared memory中的缓冲区数据进行计算
     #pragma unroll
     for (int tk = 0; tk < BK; tk++) {
       FLOAT4(r_comp_a[0]) = FLOAT4(s_a[smem_sel][tk][ty * TM / 2     ]);
@@ -434,7 +435,7 @@ __global__ void sgemm_t_8x8_sliced_k_f32x4_bcf_dbuf_kernel(
     // ((K + BK - 1) / BK) - 1 次block内的同步操作。比如，bk=1时，HFMA计算
     // 使用的是s_a[0]和s_b[0]，因此，和s_a[1]和s_b[1]的加载是没有依赖关系的。
     // 从global内存到s_a[1]和s_b[1]和HFMA计算可以并行。s_a[1]和s_b[1]用于
-    // 加载下一块BK需要的数据到共享内存。
+    // 将下一批数据从寄存器写入到shared memory缓冲区
     s_a[smem_sel_next][load_a_smem_k + 0][load_a_smem_m] = r_load_a[0];
     s_a[smem_sel_next][load_a_smem_k + 1][load_a_smem_m] = r_load_a[1];
     s_a[smem_sel_next][load_a_smem_k + 2][load_a_smem_m] = r_load_a[2];
